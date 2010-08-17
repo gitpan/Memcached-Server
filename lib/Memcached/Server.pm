@@ -13,7 +13,7 @@ Version 0.02
 
 =cut
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
 use AnyEvent::Socket;
 use AnyEvent::Handle;
@@ -25,6 +25,10 @@ use callee;
     # running as a stand alone server
     use Memcached::Server;
     my $server = Memcached::Server->new(
+	no_extra => 0 / 1, # if set to true, then the server will skip cas, expire, flag;
+			   #  thus, cas always success, never expire, flag remains 0 forever.
+			   # with this option on, one can get a entry that hasn't been set,
+			   #  as long as your 'get' and '_find' say yes.
 	open => [[0, 8888], ['127.0.0.1', 8889], ['10.0.0.5', 8889], [$host, $port], ...],
 	cmd => { # customizable handlers
 	    _find => sub {
@@ -109,6 +113,9 @@ sub new {
 	elsif( $key eq 'open' ) {
 	    $self->open(@$_) for @{shift()};
 	}
+	elsif( $key eq 'no_extra' ) {
+	    $self->{no_extra} = shift;
+	}
     }
     return $self;
 }
@@ -164,7 +171,7 @@ sub serve {
 			elsif( $cmd eq 'cas' ) {
 			    $self->_find( sub {
 				if( $_[0] ) {
-				    if( $self->{extra_data}{$key}[2]==$cas ) {
+				    if( $self->{no_extra} || $self->{extra_data}{$key}[2]==$cas ) {
 					$self->_set($client, $noreply, $key, $flag, $expire, $$data_ref);
 				    }
 				    else {
@@ -219,8 +226,8 @@ sub serve {
 		    $data[$i-$curr] = $_[1];
 		    while( $curr<$n && defined $status[0] ) {
 			if( shift @status ) {
-			    $client->push_write("VALUE $key $self->{extra_data}{$key}[1] $e{length $data[0]}");
-			    $client->push_write(" $self->{extra_data}{$key}[2]") if( $cmd eq 'gets' );
+			    $client->push_write("VALUE $key $e{ $self->{no_extra} ? 0 : $self->{extra_data}{$key}[1] } $e{length $data[0]}");
+			    $client->push_write(" $e{ $self->{no_extra} ? 0 : $self->{extra_data}{$key}[2] }") if( $cmd eq 'gets' );
 			    $client->push_write("\r\n");
 			    $client->push_write($data[0]);
 			    $client->push_write("\r\n");
@@ -341,11 +348,13 @@ sub _set {
 	my($status, $msg) = @_;
 	if( $status==1 ) {
 	    $expire += time if $expire>0 && $expire<=2592000;
-	    if( $expire<0 ) {
-		$self->{extra_data}{$key}[2] = ++$self->{cas};
-	    }
-	    else {
-		$self->{extra_data}{$key} = [$expire, $flag, ++$self->{cas}];
+	    if( !$self->{no_extra} ) {
+		if( $expire<0 ) {
+		    $self->{extra_data}{$key}[2] = ++$self->{cas};
+		}
+		else {
+		    $self->{extra_data}{$key} = [$expire, $flag, ++$self->{cas}];
+		}
 	    }
 	    $client->push_write("STORED\r\n") unless $noreply;
 	    $noreply->() if ref($noreply) eq 'CODE';
@@ -366,8 +375,8 @@ sub _set {
 
 sub _find {
     my($self, $cb, $key) = @_;
-    if( exists $self->{extra_data}{$key} ) {
-	if( !$self->{extra_data}{$key}[0] || $self->{extra_data}{$key}[0]>time ) {
+    if( $self->{no_extra} || exists $self->{extra_data}{$key} ) {
+	if( $self->{no_extra} || !$self->{extra_data}{$key}[0] || $self->{extra_data}{$key}[0]>time ) {
 	    $self->{cmd}{_find}($cb, $key);
 	}
 	else {
@@ -381,8 +390,8 @@ sub _find {
 
 sub _get {
     my($self, $cb, $key) = @_;
-    if( exists $self->{extra_data}{$key} ) {
-	if( !$self->{extra_data}{$key}[0] || $self->{extra_data}{$key}[0]>time ) {
+    if( $self->{no_extra} || exists $self->{extra_data}{$key} ) {
+	if( $self->{no_extra} || !$self->{extra_data}{$key}[0] || $self->{extra_data}{$key}[0]>time ) {
 	    $self->{cmd}{get}->($cb, $key);
 	}
 	else {
@@ -396,7 +405,7 @@ sub _get {
 
 sub _delete {
     my($self, $cb, $key) = @_;
-    if( exists $self->{extra_data}{$key} ) {
+    if( $self->{no_extra} || exists $self->{extra_data}{$key} ) {
 	my $extra_data = delete $self->{extra_data}{$key};
 	$self->{cmd}{delete}->( !$extra_data->[0] || $extra_data->[0]>time ? $cb : sub { $cb->(0) }, $key );
     }

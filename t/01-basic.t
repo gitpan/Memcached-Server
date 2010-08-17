@@ -13,11 +13,16 @@ eval {
     Memcached::Server::Default->new(
 	open => [[0, 8888]]
     );
+    Memcached::Server::Default->new(
+	open => [[0, 8889]],
+	no_extra => 1
+    );
 };
-plan skip_all => 'Cannot bind address on 0:8888' if $@;
-plan tests => 41;
+plan skip_all => 'Cannot bind address on 0:8888 and 0:8889' if $@;
+plan tests => 58;
 
 my $cv = AE::cv;
+my $cv2 = AE::cv;
 
 tcp_connect( 0, 8888, sub {
     my($fh) = @_;
@@ -277,7 +282,6 @@ tcp_connect( 0, 8888, sub {
     $cv->begin;
     $memd->push_read( line => sub {
 	is($_[1], "END", "gets data");
-	$cv->end;
 
 	$cv->begin;
 	$memd->push_read( line => sub {
@@ -322,7 +326,7 @@ tcp_connect( 0, 8888, sub {
 	    is($_[1], "OK", "flush_all");
 	    $cv->end;
 	} );
-	$memd->push_write("flush_all");
+	$memd->push_write("flush_all\r\n");
 
 	$cv->begin;
 	$memd->push_read( line => sub {
@@ -330,9 +334,114 @@ tcp_connect( 0, 8888, sub {
 	    $cv->end;
 	} );
 	$memd->push_write("gets CindyLinz\r\n");
+
+	$cv->end;
     } );
     $memd->push_write("gets CindyLinz\r\n");
+} );
 
+tcp_connect( 0, 8889, sub {
+    my($fh) = @_;
+    my $memd;
+    $memd = AnyEvent::Handle->new( fh => $fh, on_error => sub { undef $memd } );
+
+    $cv2->begin;
+    $memd->push_read( line => sub {
+	is($_[1], "STORED", "set data");
+	$cv2->end;
+    } );
+    $memd->push_write("set CindyLinz 3 0 4\r\nGood\r\n");
+
+    $cv2->begin;
+    $memd->push_read( line => sub {
+	is($_[1], "VALUE CindyLinz 0 4", "get data");
+	$cv2->end;
+    } );
+    $cv2->begin;
+    $memd->push_read( line => sub {
+	is($_[1], "Good", "get data");
+	$cv2->end;
+    } );
+    $cv2->begin;
+    $memd->push_read( line => sub {
+	is($_[1], "END", "get data");
+	$cv2->end;
+    } );
+    $memd->push_write("get CindyLinz\r\n");
+
+    my $cas;
+
+    $cv2->begin;
+    $memd->push_read( line => sub {
+	like($_[1], qr/^VALUE CindyLinz 0 4 \d+$/, "gets data");
+	($cas) = $_[1] =~ /(\d+)$/;
+	$cv2->end;
+    } );
+    $cv2->begin;
+    $memd->push_read( line => sub {
+	is($_[1], "Good", "gets data");
+	$cv2->end;
+    } );
+    $cv2->begin;
+    $memd->push_read( line => sub {
+	is($_[1], "END", "gets data");
+
+	$cv2->begin;
+	$memd->push_read( line => sub {
+	    is($_[1], "NOT_FOUND", "cas not found");
+	    $cv2->end;
+	} );
+	$memd->push_write("cas CindyLinz2 0 0 3 5\r\nabc\r\n");
+
+	$cv2->begin;
+	$memd->push_read( line => sub {
+	    is($_[1], "STORED", "cas exists no extra");
+	    $cv2->end;
+	} );
+	$memd->push_write("cas CindyLinz 0 0 3 $e{$cas+1}\r\nabc\r\n");
+
+	$cv2->begin;
+	$memd->push_read( line => sub {
+	    is($_[1], "STORED", "cas data");
+	    $cv2->end;
+	} );
+	$memd->push_write("cas CindyLinz 0 0 3 $cas\r\nabc\r\n");
+
+	$cv2->begin;
+	$memd->push_read( line => sub {
+	    like($_[1], qr/VALUE CindyLinz 0 3 \d+/, "cas check");
+	    $cv2->end;
+	} );
+	$cv2->begin;
+	$memd->push_read( line => sub {
+	    is($_[1], "abc", "cas check");
+	    $cv2->end;
+	} );
+	$cv2->begin;
+	$memd->push_read( line => sub {
+	    is($_[1], "END", "cas check");
+	    $cv2->end;
+	} );
+	$memd->push_write("gets CindyLinz\r\n");
+
+	$cv2->begin;
+	$memd->push_read( line => sub {
+	    is($_[1], "OK", "flush_all");
+	    $cv2->end;
+	} );
+	$memd->push_write("flush_all\r\n");
+
+	$cv2->begin;
+	$memd->push_read( line => sub {
+	    is($_[1], "END", "check flush_all");
+	    $cv2->end;
+	} );
+	$memd->push_write("gets CindyLinz\r\n");
+
+	$cv2->end;
+    } );
+    $memd->push_write("gets CindyLinz\r\n");
 } );
 
 $cv->recv;
+$cv2->recv;
