@@ -7,4 +7,5 @@ lib/Memcached/Server/Default.pm
 t/00-load.t
 t/manifest.t
 t/pod.t
+t/01-basic.t
 META.yml                                 Module meta-data (added by MakeMaker)

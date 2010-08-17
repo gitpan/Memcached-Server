@@ -11,7 +11,7 @@ Memcached::Server::Default - A pure perl Memcached server
 
 =head1 VERSION
 
-Version 0.01
+Version 0.02
 
 =cut
 
