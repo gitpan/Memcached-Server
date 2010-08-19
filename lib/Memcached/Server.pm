@@ -9,11 +9,11 @@ Memcached::Server - A pure perl Memcached server helper, that help you create a 
 
 =head1 VERSION
 
-Version 0.02
+Version 0.04
 
 =cut
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 use AnyEvent::Socket;
 use AnyEvent::Handle;
@@ -32,21 +32,21 @@ use callee;
 	open => [[0, 8888], ['127.0.0.1', 8889], ['10.0.0.5', 8889], [$host, $port], ...],
 	cmd => { # customizable handlers
 	    _find => sub {
-		my($cb, $key) = @_;
+		my($cb, $key, $client) = @_;
 		...
 		$cb->(0); # not found
 		... or ...
 		$cb->(1); # found
 	    },
 	    get => sub {
-		my($cb, $key) = @_;
+		my($cb, $key, $client) = @_;
 		...
 		$cb->(0); # not found
 		... or ...
 		$cb->(1, $data); # found
 	    },
 	    set => sub {
-		my($cb, $key, $flag, $expire, $value) = @_;
+		my($cb, $key, $flag, $expire, $value, $client) = @_;
 		...
 		$cb->(1); # success
 		... or ...
@@ -55,17 +55,29 @@ use callee;
 		$cb->(-2, $error_message); # error occured, and close the connection immediately.
 	    },
 	    delete => sub {
-		my($cb, $key) = @_;
+		my($cb, $key, $client) = @_;
 		...
 		$cb->(0); # not found
 		... or ...
 		$cb->(1); # success
 	    },
 	    flush_all => sub {
-		my($cb) = @_;
+		my($cb, $client) = @_;
 		...
 		$cb->();
 	    },
+	    _begin => sub { # called when a client is accepted or assigned by 'serve' method (optional)
+		my($cb, $client) = @_;
+		...
+		$cb->();
+	    },
+	    _end => sub { # called when a client disconnects (optional)
+		my($cb, $client) = @_;
+		...
+		$cb->();
+	    },
+	    # NOTE: the $client, a AnyEvent::Handle object, is presented for keeping per connection information by using it as a hash key.
+	    #  it's not recommended to read or write to this object directly, that might break the protocol consistency.
 	}
     );
     ...
@@ -135,169 +147,173 @@ sub serve {
     $client = AnyEvent::Handle->new(
 	fh => $fh,
 	on_error => sub {
-	    undef $client;
+	    $self->_end( sub {
+		undef $client;
+	    } );
 	},
     );
-    $client->push_read( line => sub {
-	#$client->push_write("line: $_[1]\n");
-	if( my($cmd, $key, $flag, $expire, $size, $cas, $noreply) = $_[1] =~ /^ *(set|add|replace|append|prepend|cas) +([^ ]+) +(\d+) +(\d+) +(\d+)(?: +(\d+))?( +noreply)? *$/ ) {
-	    $client->unshift_read( chunk => $size, sub {
-		my $data_ref = \$_[1];
-		$client->unshift_read( line => sub {
-		    if( $_[1] eq '' ) {
-			if( $cmd eq 'set' ) {
-			    $self->_set($client, $noreply, $key, $flag, $expire, $$data_ref);
-			}
-			elsif( $cmd eq 'add' ) {
-			    $self->_find( sub {
-				if( $_[0] ) {
-				    $client->push_write("NOT_STORED\r\n") unless $noreply;
-				}
-				else {
-				    $self->_set($client, $noreply, $key, $flag, $expire, $$data_ref);
-				}
-			    }, $key );
-			}
-			elsif( $cmd eq 'replace' ) {
-			    $self->_find( sub {
-				if( $_[0] ) {
-				    $self->_set($client, $noreply, $key, $flag, $expire, $$data_ref);
-				}
-				else {
-				    $client->push_write("NOT_STORED\r\n") unless $noreply;
-				}
-			    }, $key );
-			}
-			elsif( $cmd eq 'cas' ) {
-			    $self->_find( sub {
-				if( $_[0] ) {
-				    if( $self->{no_extra} || $self->{extra_data}{$key}[2]==$cas ) {
+    $self->_begin( sub {
+	$client->push_read( line => sub {
+	    #$client->push_write("line: $_[1]\n");
+	    if( my($cmd, $key, $flag, $expire, $size, $cas, $noreply) = $_[1] =~ /^ *(set|add|replace|append|prepend|cas) +([^ ]+) +(\d+) +(\d+) +(\d+)(?: +(\d+))?( +noreply)? *$/ ) {
+		$client->unshift_read( chunk => $size, sub {
+		    my $data_ref = \$_[1];
+		    $client->unshift_read( line => sub {
+			if( $_[1] eq '' ) {
+			    if( $cmd eq 'set' ) {
+				$self->_set($client, $noreply, $key, $flag, $expire, $$data_ref);
+			    }
+			    elsif( $cmd eq 'add' ) {
+				$self->_find( sub {
+				    if( $_[0] ) {
+					$client->push_write("NOT_STORED\r\n") unless $noreply;
+				    }
+				    else {
+					$self->_set($client, $noreply, $key, $flag, $expire, $$data_ref);
+				    }
+				}, $key, $client );
+			    }
+			    elsif( $cmd eq 'replace' ) {
+				$self->_find( sub {
+				    if( $_[0] ) {
 					$self->_set($client, $noreply, $key, $flag, $expire, $$data_ref);
 				    }
 				    else {
-					$client->push_write("EXISTS\r\n") unless $noreply;
+					$client->push_write("NOT_STORED\r\n") unless $noreply;
 				    }
-				}
-				else {
-				    $client->push_write("NOT_FOUND\r\n") unless $noreply;
-				}
-			    }, $key );
+				}, $key, $client );
+			    }
+			    elsif( $cmd eq 'cas' ) {
+				$self->_find( sub {
+				    if( $_[0] ) {
+					if( $self->{no_extra} || $self->{extra_data}{$key}[2]==$cas ) {
+					    $self->_set($client, $noreply, $key, $flag, $expire, $$data_ref);
+					}
+					else {
+					    $client->push_write("EXISTS\r\n") unless $noreply;
+					}
+				    }
+				    else {
+					$client->push_write("NOT_FOUND\r\n") unless $noreply;
+				    }
+				}, $key, $client );
+			    }
+			    elsif( $cmd eq 'prepend' ) {
+				$self->_get( sub {
+				    if( $_[0] ) {
+					$self->_set($client, $noreply, $key, -1, -1, "$$data_ref$_[1]");
+				    }
+				    else {
+					$client->push_write("NOT_STORED\r\n") unless $noreply;
+				    }
+				}, $key, $client );
+			    }
+			    elsif( $cmd eq 'append' ) {
+				$self->_get( sub {
+				    if( $_[0] ) {
+					$self->_set($client, $noreply, $key, -1, -1, "$_[1]$$data_ref");
+				    }
+				    else {
+					$client->push_write("NOT_STORED\r\n") unless $noreply;
+				    }
+				}, $key, $client );
+			    }
 			}
-			elsif( $cmd eq 'prepend' ) {
-			    $self->_get( sub {
-				if( $_[0] ) {
-				    $self->_set($client, $noreply, $key, -1, -1, "$$data_ref$_[1]");
-				}
-				else {
-				    $client->push_write("NOT_STORED\r\n") unless $noreply;
-				}
-			    }, $key );
+			else {
+			    $client->push_write("CLIENT_ERROR bad data chunk\r\n") unless $noreply;
+			    $client->push_write("ERROR\r\n");
 			}
-			elsif( $cmd eq 'append' ) {
-			    $self->_get( sub {
-				if( $_[0] ) {
-				    $self->_set($client, $noreply, $key, -1, -1, "$_[1]$$data_ref");
-				}
-				else {
-				    $client->push_write("NOT_STORED\r\n") unless $noreply;
-				}
-			    }, $key );
-			}
-		    }
-		    else {
-			$client->push_write("CLIENT_ERROR bad data chunk\r\n") unless $noreply;
-			$client->push_write("ERROR\r\n");
-		    }
+		    } );
 		} );
-	    } );
-	}
-	elsif( $_[1] =~ /^ *(gets?) +([^ ].*) *$/ ) {
-	    my($cmd, $keys) = ($1, $2);
-	    my $n = 0;
-	    my $curr = 0;
-	    my @status;
-	    my @data;
-	    my $end;
-	    while( $keys =~ /([^ ]+)/g ) {
-		my $key = $1;
-		my $i = $n++;
-		$self->_get( sub {
-		    $status[$i-$curr] = $_[0];
-		    $data[$i-$curr] = $_[1];
-		    while( $curr<$n && defined $status[0] ) {
-			if( shift @status ) {
-			    $client->push_write("VALUE $key $e{ $self->{no_extra} ? 0 : $self->{extra_data}{$key}[1] } $e{length $data[0]}");
-			    $client->push_write(" $e{ $self->{no_extra} ? 0 : $self->{extra_data}{$key}[2] }") if( $cmd eq 'gets' );
-			    $client->push_write("\r\n");
-			    $client->push_write($data[0]);
-			    $client->push_write("\r\n");
-			    shift @data;
+	    }
+	    elsif( $_[1] =~ /^ *(gets?) +([^ ].*) *$/ ) {
+		my($cmd, $keys) = ($1, $2);
+		my $n = 0;
+		my $curr = 0;
+		my @status;
+		my @data;
+		my $end;
+		while( $keys =~ /([^ ]+)/g ) {
+		    my $key = $1;
+		    my $i = $n++;
+		    $self->_get( sub {
+			$status[$i-$curr] = $_[0];
+			$data[$i-$curr] = $_[1];
+			while( $curr<$n && defined $status[0] ) {
+			    if( shift @status ) {
+				$client->push_write("VALUE $key $e{ $self->{no_extra} ? 0 : $self->{extra_data}{$key}[1] } $e{length $data[0]}");
+				$client->push_write(" $e{ $self->{no_extra} ? 0 : $self->{extra_data}{$key}[2] }") if( $cmd eq 'gets' );
+				$client->push_write("\r\n");
+				$client->push_write($data[0]);
+				$client->push_write("\r\n");
+				shift @data;
+			    }
+			    ++$curr;
 			}
-			++$curr;
-		    }
-		    $client->push_write("END\r\n") if( $end && $curr==$n );
-		}, $key );
-	    }
-	    if( $curr==$n ) {
-		$client->push_write("END\r\n");
-	    }
-	    else {
-		$end = 1;
-	    }
-	}
-	elsif( ($key, $noreply) = $_[1] =~ /^ *delete +([^ ]+)( +noreply)? *$/ ) {
-	    $self->_delete( sub {
-		if( !$noreply ) {
-		    if( $_[0] ) {
-			$client->push_write("DELETED\r\n");
-		    }
-		    else {
-			$client->push_write("NOT_FOUND\r\n");
-		    }
+			$client->push_write("END\r\n") if( $end && $curr==$n );
+		    }, $key, $client );
 		}
-	    }, $key );
-	}
-	elsif( ($cmd, $key, my $val, $noreply) = $_[1] =~ /^ *(incr|decr) +([^ ]+) +(\d+)( +noreply)? *$/ ) {
-	    $self->_get( sub {
-		if( $_[0] ) {
-		    if( $cmd eq 'incr' ) {
-			no warnings 'numeric';
-			$val = $_[1] + $val;
-		    }
-		    else {
-			no warnings 'numeric';
-			$val = $_[1] - $val;
-			$val = 0 if $val<0;
-		    }
-		    $self->_set($client, sub { $client->push_write("$val\r\n") unless $noreply }, $key, -1, -1, $val);
+		if( $curr==$n ) {
+		    $client->push_write("END\r\n");
 		}
 		else {
-		    $client->push_write("NOT_FOUND\r\n") unless $noreply;
+		    $end = 1;
 		}
-	    }, $key );
-	}
-	elsif( $_[1] =~ /^ *stats *$/ ) {
-	    $client->push_write("END\r\n");
-	}
-	elsif( ($noreply) = $_[1] =~ /^ *flush_all( +noreply)? *$/ ) {
-	    $self->_flush_all( sub {
-		$client->push_write("OK\r\n") unless $noreply;
-	    } );
-	}
-	elsif( $_[1] =~ /^ *verbosity( +noreply)? *$/ ) {
-	    $client->push_write("OK\r\n") if !$1;
-	}
-	elsif( $_[1] =~ /^ *version *$/ ) {
-	    $client->push_write("VERSION 1.4.4\r\n");
-	}
-	elsif( $_[1] =~ /^ *quit *$/ ) {
-	    $client->push_shutdown;
-	}
-	else {
-	    $client->push_write("ERROR\r\n");
-	}
-	$client->push_read( line => callee );
-    } );
+	    }
+	    elsif( ($key, $noreply) = $_[1] =~ /^ *delete +([^ ]+)( +noreply)? *$/ ) {
+		$self->_delete( sub {
+		    if( !$noreply ) {
+			if( $_[0] ) {
+			    $client->push_write("DELETED\r\n");
+			}
+			else {
+			    $client->push_write("NOT_FOUND\r\n");
+			}
+		    }
+		}, $key, $client );
+	    }
+	    elsif( ($cmd, $key, my $val, $noreply) = $_[1] =~ /^ *(incr|decr) +([^ ]+) +(\d+)( +noreply)? *$/ ) {
+		$self->_get( sub {
+		    if( $_[0] ) {
+			if( $cmd eq 'incr' ) {
+			    no warnings 'numeric';
+			    $val = $_[1] + $val;
+			}
+			else {
+			    no warnings 'numeric';
+			    $val = $_[1] - $val;
+			    $val = 0 if $val<0;
+			}
+			$self->_set($client, sub { $client->push_write("$val\r\n") unless $noreply }, $key, -1, -1, $val);
+		    }
+		    else {
+			$client->push_write("NOT_FOUND\r\n") unless $noreply;
+		    }
+		}, $key, $client );
+	    }
+	    elsif( $_[1] =~ /^ *stats *$/ ) {
+		$client->push_write("END\r\n");
+	    }
+	    elsif( ($noreply) = $_[1] =~ /^ *flush_all( +noreply)? *$/ ) {
+		$self->_flush_all( sub {
+		    $client->push_write("OK\r\n") unless $noreply;
+		} );
+	    }
+	    elsif( $_[1] =~ /^ *verbosity( +noreply)? *$/ ) {
+		$client->push_write("OK\r\n") if !$1;
+	    }
+	    elsif( $_[1] =~ /^ *version *$/ ) {
+		$client->push_write("VERSION 1.4.4\r\n");
+	    }
+	    elsif( $_[1] =~ /^ *quit *$/ ) {
+		$client->push_shutdown;
+	    }
+	    else {
+		$client->push_write("ERROR\r\n");
+	    }
+	    $client->push_read( line => callee );
+	} );
+    }, $client );
 }
 
 =head2 $server->open( host, port )
@@ -334,7 +350,7 @@ sub close_all {
     $self->{open} = [];
 }
 
-=head2 $server->_set, $server->_find, $server->_get, $server->_delete, $server->_flush_all
+=head2 $server->_set, $server->_find, $server->_get, $server->_delete, $server->_flush_all, $server->_begin, $server->_end
 
 These methods are the main function methods used by the server.
 They should be used or overrided when you implementing your own server and you want
@@ -370,17 +386,17 @@ sub _set {
 	    warn "Unknown 'set' callback status: $status";
 	    $client->push_write("SERVER_ERROR $msg\r\n");
 	}
-    }, $key, $flag, $expire, $_[6]);
+    }, $key, $flag, $expire, $_[6], $client);
 }
 
 sub _find {
-    my($self, $cb, $key) = @_;
+    my($self, $cb, $key, $client) = @_;
     if( $self->{no_extra} || exists $self->{extra_data}{$key} ) {
 	if( $self->{no_extra} || !$self->{extra_data}{$key}[0] || $self->{extra_data}{$key}[0]>time ) {
-	    $self->{cmd}{_find}($cb, $key);
+	    $self->{cmd}{_find}($cb, $key, $client);
 	}
 	else {
-	    $self->_delete( sub { $cb->(0) }, $key ); 
+	    $self->_delete( sub { $cb->(0) }, $key, $client ); 
 	}
     }
     else {
@@ -389,13 +405,13 @@ sub _find {
 }
 
 sub _get {
-    my($self, $cb, $key) = @_;
+    my($self, $cb, $key, $client) = @_;
     if( $self->{no_extra} || exists $self->{extra_data}{$key} ) {
 	if( $self->{no_extra} || !$self->{extra_data}{$key}[0] || $self->{extra_data}{$key}[0]>time ) {
-	    $self->{cmd}{get}->($cb, $key);
+	    $self->{cmd}{get}->($cb, $key, $client);
 	}
 	else {
-	    $self->_delete( sub { $cb->(0) }, $key ); 
+	    $self->_delete( sub { $cb->(0) }, $key, $client ); 
 	}
     }
     else {
@@ -404,10 +420,10 @@ sub _get {
 }
 
 sub _delete {
-    my($self, $cb, $key) = @_;
+    my($self, $cb, $key, $client) = @_;
     if( $self->{no_extra} || exists $self->{extra_data}{$key} ) {
 	my $extra_data = delete $self->{extra_data}{$key};
-	$self->{cmd}{delete}->( !$extra_data->[0] || $extra_data->[0]>time ? $cb : sub { $cb->(0) }, $key );
+	$self->{cmd}{delete}->( !$extra_data->[0] || $extra_data->[0]>time ? $cb : sub { $cb->(0) }, $key, $client );
     }
     else {
 	$cb->(0);
@@ -415,11 +431,31 @@ sub _delete {
 }
 
 sub _flush_all {
-    my($self, $cb) = @_;
+    my($self, $cb, $client) = @_;
     $self->{cmd}{flush_all}->( sub {
 	$self->{extra_data} = {};
 	$cb->();
-    } );
+    }, $client );
+}
+
+sub _begin {
+    my($self, $cb, $client) = @_;
+    if( exists $self->{cmd}{_begin} ) {
+	$self->{cmd}{_begin}->($cb, $client);
+    }
+    else {
+	$cb->();
+    }
+}
+
+sub _end {
+    my($self, $cb, $client) = @_;
+    if( exists $self->{cmd}{_end} ) {
+	$self->{cmd}{_end}->($cb, $client);
+    }
+    else {
+	$cb->();
+    }
 }
 
 =head1 SEE ALSO

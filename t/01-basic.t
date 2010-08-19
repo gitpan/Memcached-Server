@@ -19,7 +19,7 @@ eval {
     );
 };
 plan skip_all => 'Cannot bind address on 0:8888 and 0:8889' if $@;
-plan tests => 58;
+plan tests => 64;
 
 my $cv = AE::cv;
 my $cv2 = AE::cv;
@@ -70,6 +70,7 @@ tcp_connect( 0, 8888, sub {
 	is($_[1], "Good", "get multiple data");
 	$cv->end;
     } );
+    $cv->begin;
     $memd->push_read( line => sub {
 	is($_[1], "VALUE CindyLinz 3 4", "get multiple data");
 	$cv->end;

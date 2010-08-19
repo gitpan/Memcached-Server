@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Memcached-Server
-version:            0.03
+version:            0.04
 abstract:           A pure perl Memcached server helper, that help you create a server speaking Memcached protocol
 author:
     - Cindy Wang (CindyLinz)
